@@ -7,6 +7,7 @@ const requestLogger  = require('./middleware/requestLogger');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const foodItemsRouter = require('./routes/foodItems');
 const ordersRouter    = require('./routes/orders');
+const { createGraphQLServer } = require('./graphql/yoga');
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -40,15 +41,22 @@ app.get('/health', (req, res) => {
 app.use('/api/food-items', foodItemsRouter);
 app.use('/api/orders',     ordersRouter);
 
+// ─── GraphQL API ──────────────────────────────────────────────────────────────
+const yoga = createGraphQLServer();
+app.use('/graphql', yoga);
+
 // ─── Error Handling ───────────────────────────────────────────────────────────
 app.use(notFoundHandler);
 app.use(errorHandler);
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  logger.info(`🚀 FoodOrder Backend running on http://localhost:${PORT}`);
-  logger.info(`   Environment : ${process.env.NODE_ENV || 'development'}`);
-  logger.info(`   Supabase    : ${process.env.SUPABASE_URL ? 'Connected' : 'NOT CONFIGURED'}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    logger.info(`🚀 FoodOrder Backend running on http://localhost:${PORT}`);
+    logger.info(`   Environment : ${process.env.NODE_ENV || 'development'}`);
+    logger.info(`   Supabase    : ${process.env.SUPABASE_URL ? 'Connected' : 'NOT CONFIGURED'}`);
+    logger.info(`   GraphQL     : http://localhost:${PORT}/graphql`);
+  });
+}
 
 module.exports = app;

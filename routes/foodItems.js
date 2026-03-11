@@ -16,7 +16,7 @@ const invalidateCache = () => { cache = null; cacheTime = 0; };
 const FoodItemSchema = z.object({
   name:        z.string().min(1).max(255),
   description: z.string().optional(),
-  category:    z.enum(['Sandwiches', 'Pizza', 'Cake']),
+  category:    z.enum(['Sandwiches', 'Pizza', 'Cake','Desserts','Drinks','Main Course','Burgers']),
   price:       z.number().positive(),
   imageUrl:    z.string().url().optional().or(z.literal('')),
   available:   z.boolean().optional().default(true),
@@ -112,10 +112,9 @@ router.put('/:id', async (req, res, next) => {
       .from('food_items')
       .update(parsed.data)
       .eq('id', req.params.id)
-      .select()
-      .single();
+      .select();
 
-    if (error || !data) throw createError(404, 'NOT_FOUND', 'Food item not found');
+    if (error || !data) throw createError(404, 'NOT_FOUND', 'Food item not found'+error.message);
 
     invalidateCache();
     res.json({ data, message: 'Food item updated successfully' });

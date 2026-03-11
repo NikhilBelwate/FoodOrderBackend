@@ -2,6 +2,7 @@ const express = require('express');
 const { z }   = require('zod');
 const { supabase, supabaseAdmin } = require('../config/supabase');
 const { createError } = require('../middleware/errorHandler');
+const { requireAuth }  = require('../middleware/authMiddleware');
 const { generateOrderId } = require('../utils/orderIdGenerator');
 
 const router = express.Router();
@@ -25,10 +26,10 @@ const OrderStatusSchema = z.object({
   status: z.enum(['Pending', 'Confirmed', 'Preparing', 'Ready', 'Delivered', 'Cancelled']),
 });
 
-// ─── POST /api/orders ─────────────────────────────────────────────────────────
-router.post('/', async (req, res, next) => {
+// ─── POST /api/orders  [AUTH REQUIRED] ───────────────────────────────────────
+router.post('/', requireAuth, async (req, res, next) => {
   try {
-    // 1. Validate request body
+    // 1. Validate body
     const parsed = CreateOrderSchema.safeParse(req.body);
     if (!parsed.success) {
       throw createError(
@@ -40,7 +41,7 @@ router.post('/', async (req, res, next) => {
 
     const { customerName, customerEmail, customerPhone, deliveryAddress, specialInstructions, items } = parsed.data;
 
-    // 2. Fetch food items to get current prices
+    // 2. Fetch + validate food items
     const foodItemIds = items.map(i => i.foodItemId);
     const { data: foodItems, error: fetchError } = await supabaseAdmin
       .from('food_items')
@@ -49,17 +50,16 @@ router.post('/', async (req, res, next) => {
 
     if (fetchError) throw createError(500, 'DB_ERROR', fetchError.message);
 
-    // Validate all items exist and are available
     const foodItemMap = {};
     foodItems.forEach(f => { foodItemMap[f.id] = f; });
 
     for (const item of items) {
       const food = foodItemMap[item.foodItemId];
-      if (!food)          throw createError(404, 'ITEM_NOT_FOUND',    `Food item ${item.foodItemId} not found`);
+      if (!food)           throw createError(404, 'ITEM_NOT_FOUND',    `Food item ${item.foodItemId} not found`);
       if (!food.available) throw createError(400, 'ITEM_UNAVAILABLE', `${food.name} is currently unavailable`);
     }
 
-    // 3. Calculate total price
+    // 3. Calculate total
     let totalPrice = 0;
     const enrichedItems = items.map(item => {
       const food  = foodItemMap[item.foodItemId];
@@ -68,7 +68,7 @@ router.post('/', async (req, res, next) => {
       return { foodItemId: item.foodItemId, quantity: item.quantity, unitPrice: parseFloat(food.price) };
     });
 
-    // 4. Create order record
+    // 4. Create order — attach authenticated user_id
     const orderId = generateOrderId();
     const { data: order, error: orderError } = await supabaseAdmin
       .from('orders')
@@ -79,8 +79,9 @@ router.post('/', async (req, res, next) => {
         customerPhone,
         deliveryAddress,
         specialInstructions,
-        totalPrice: totalPrice.toFixed(2),
-        status: 'Pending',
+        totalPrice:  totalPrice.toFixed(2),
+        status:      'Pending',
+        user_id:     req.user.id,            // ← link to auth user
       }])
       .select()
       .single();
@@ -100,7 +101,6 @@ router.post('/', async (req, res, next) => {
       .insert(orderItemsData);
 
     if (itemsError) {
-      // Rollback: delete the order if items insertion fails
       await supabaseAdmin.from('orders').delete().eq('id', order.id);
       throw createError(500, 'DB_ERROR', `Failed to save order items: ${itemsError.message}`);
     }
@@ -120,10 +120,10 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-// ─── GET /api/orders ──────────────────────────────────────────────────────────
-router.get('/', async (req, res, next) => {
+// ─── GET /api/orders  [AUTH REQUIRED — returns user's own orders] ─────────────
+router.get('/', requireAuth, async (req, res, next) => {
   try {
-    const { status, email, sortBy = 'date', page = 1, limit = 20 } = req.query;
+    const { status, sortBy = 'date', page = 1, limit = 20 } = req.query;
 
     const pageNum  = Math.max(1, parseInt(page));
     const pageSize = Math.min(100, Math.max(1, parseInt(limit)));
@@ -133,6 +133,7 @@ router.get('/', async (req, res, next) => {
     let query = supabaseAdmin
       .from('orders')
       .select('*, order_items(id, foodItemId, quantity, price, food_items(id, name, category, imageUrl))', { count: 'exact' })
+      .eq('user_id', req.user.id)           // ← only this user's orders
       .range(from, to);
 
     if (status) {
@@ -143,16 +144,9 @@ router.get('/', async (req, res, next) => {
       query = query.eq('status', status);
     }
 
-    if (email) {
-      query = query.ilike('customerEmail', email);
-    }
-
-    // Sort
-    if (sortBy === 'status') {
-      query = query.order('status', { ascending: true });
-    } else {
-      query = query.order('"createdAt"', { ascending: false });
-    }
+    query = sortBy === 'status'
+      ? query.order('status', { ascending: true })
+      : query.order('"createdAt"', { ascending: false });
 
     const { data, error, count } = await query;
     if (error) throw createError(500, 'DB_ERROR', error.message);
@@ -160,10 +154,8 @@ router.get('/', async (req, res, next) => {
     res.json({
       data,
       pagination: {
-        page:       pageNum,
-        limit:      pageSize,
-        total:      count,
-        totalPages: Math.ceil(count / pageSize),
+        page: pageNum, limit: pageSize,
+        total: count,  totalPages: Math.ceil(count / pageSize),
       },
     });
   } catch (err) {
@@ -171,27 +163,23 @@ router.get('/', async (req, res, next) => {
   }
 });
 
-// ─── GET /api/orders/:orderId ─────────────────────────────────────────────────
-router.get('/:orderId', async (req, res, next) => {
+// ─── GET /api/orders/:orderId  [AUTH REQUIRED] ───────────────────────────────
+router.get('/:orderId', requireAuth, async (req, res, next) => {
   try {
-    const { orderId } = req.params;
-
     const { data, error } = await supabaseAdmin
       .from('orders')
       .select(`
         *,
         order_items (
-          id,
-          foodItemId,
-          quantity,
-          price,
+          id, foodItemId, quantity, price,
           food_items ( id, name, description, category, imageUrl )
         )
       `)
-      .eq('orderId', orderId)
+      .eq('orderId', req.params.orderId)
+      .eq('user_id', req.user.id)           // ← user can only see their own
       .single();
 
-    if (error || !data) throw createError(404, 'NOT_FOUND', `Order ${orderId} not found`);
+    if (error || !data) throw createError(404, 'NOT_FOUND', `Order ${req.params.orderId} not found`);
 
     res.json({ data });
   } catch (err) {
@@ -199,8 +187,8 @@ router.get('/:orderId', async (req, res, next) => {
   }
 });
 
-// ─── PUT /api/orders/:orderId/status (Admin) ──────────────────────────────────
-router.put('/:orderId/status', async (req, res, next) => {
+// ─── PUT /api/orders/:orderId/status  [AUTH REQUIRED — admin] ────────────────
+router.put('/:orderId/status', requireAuth, async (req, res, next) => {
   try {
     const parsed = OrderStatusSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -230,19 +218,18 @@ router.put('/:orderId/status', async (req, res, next) => {
   }
 });
 
-// ─── DELETE /api/orders/:orderId (Soft cancel - Admin) ────────────────────────
-router.delete('/:orderId', async (req, res, next) => {
+// ─── DELETE /api/orders/:orderId  [AUTH REQUIRED — cancel pending] ────────────
+router.delete('/:orderId', requireAuth, async (req, res, next) => {
   try {
     const { data: existing, error: fetchErr } = await supabaseAdmin
       .from('orders')
-      .select('id, status')
+      .select('id, status, user_id')
       .eq('orderId', req.params.orderId)
       .single();
 
     if (fetchErr || !existing) throw createError(404, 'NOT_FOUND', `Order ${req.params.orderId} not found`);
-    if (existing.status !== 'Pending') {
-      throw createError(400, 'CANNOT_CANCEL', 'Only Pending orders can be cancelled');
-    }
+    if (existing.user_id !== req.user.id) throw createError(403, 'FORBIDDEN', 'You cannot cancel this order');
+    if (existing.status !== 'Pending')    throw createError(400, 'CANNOT_CANCEL', 'Only Pending orders can be cancelled');
 
     const { data, error } = await supabaseAdmin
       .from('orders')
