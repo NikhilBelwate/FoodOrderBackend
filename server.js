@@ -7,7 +7,14 @@ const requestLogger  = require('./middleware/requestLogger');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
 const foodItemsRouter = require('./routes/foodItems');
 const ordersRouter    = require('./routes/orders');
+const adminRouter     = require('./routes/admin');
+const categoriesRouter = require('./routes/categories');
 const { createGraphQLServer } = require('./graphql/yoga');
+
+// When categories change, bust the category-name cache inside foodItems.js
+categoriesRouter.on && categoriesRouter.on('category_changed', () => {
+  foodItemsRouter.invalidateCategoryCache && foodItemsRouter.invalidateCategoryCache();
+});
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -18,8 +25,8 @@ app.use(cors({
     process.env.FRONTEND_URL || 'http://localhost:3000',
     'http://localhost:3001',
   ],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Admin-Key'],
   credentials: true,
 }));
 
@@ -40,6 +47,8 @@ app.get('/health', (req, res) => {
 // ─── API Routes ───────────────────────────────────────────────────────────────
 app.use('/api/food-items', foodItemsRouter);
 app.use('/api/orders',     ordersRouter);
+app.use('/api/admin',      adminRouter);
+app.use('/api/categories', categoriesRouter);
 
 // ─── GraphQL API ──────────────────────────────────────────────────────────────
 const yoga = createGraphQLServer();
@@ -56,6 +65,9 @@ if (require.main === module) {
     logger.info(`   Environment : ${process.env.NODE_ENV || 'development'}`);
     logger.info(`   Supabase    : ${process.env.SUPABASE_URL ? 'Connected' : 'NOT CONFIGURED'}`);
     logger.info(`   GraphQL     : http://localhost:${PORT}/graphql`);
+    logger.info(`   Admin API   : http://localhost:${PORT}/api/admin  [X-Admin-Key required]`);
+    logger.info(`   Categories  : http://localhost:${PORT}/api/categories`);
+    logger.info(`   Admin Key   : ${process.env.ADMIN_SECRET_KEY ? 'Set ✓' : 'NOT SET — admin routes will return 500'}`);
   });
 }
 
