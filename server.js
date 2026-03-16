@@ -5,11 +5,13 @@ const cors       = require('cors');
 const logger     = require('./config/logger');
 const requestLogger  = require('./middleware/requestLogger');
 const { errorHandler, notFoundHandler } = require('./middleware/errorHandler');
-const foodItemsRouter = require('./routes/foodItems');
-const ordersRouter    = require('./routes/orders');
-const adminRouter     = require('./routes/admin');
+const foodItemsRouter  = require('./routes/foodItems');
+const ordersRouter     = require('./routes/orders');
+const adminRouter      = require('./routes/admin');
 const categoriesRouter = require('./routes/categories');
+const paymentsRouter   = require('./routes/payments');
 const { createGraphQLServer } = require('./graphql/yoga');
+const { verifyStripeToken } = require('./services/stripeService');
 
 // When categories change, bust the category-name cache inside foodItems.js
 categoriesRouter.on && categoriesRouter.on('category_changed', () => {
@@ -30,6 +32,13 @@ app.use(cors({
   credentials: true,
 }));
 
+// Capture raw body for Stripe webhook signature verification
+app.use((req, res, next) => {
+  let raw = '';
+  req.on('data', chunk => { raw += chunk; });
+  req.on('end', () => { req.rawBody = raw; });
+  next();
+});
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(requestLogger);
@@ -49,6 +58,7 @@ app.use('/api/food-items', foodItemsRouter);
 app.use('/api/orders',     ordersRouter);
 app.use('/api/admin',      adminRouter);
 app.use('/api/categories', categoriesRouter);
+app.use('/api/payments',   paymentsRouter);
 
 // ─── GraphQL API ──────────────────────────────────────────────────────────────
 const yoga = createGraphQLServer();
@@ -60,14 +70,27 @@ app.use(errorHandler);
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
 if (require.main === module) {
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
     logger.info(`🚀 FoodOrder Backend running on http://localhost:${PORT}`);
     logger.info(`   Environment : ${process.env.NODE_ENV || 'development'}`);
     logger.info(`   Supabase    : ${process.env.SUPABASE_URL ? 'Connected' : 'NOT CONFIGURED'}`);
     logger.info(`   GraphQL     : http://localhost:${PORT}/graphql`);
     logger.info(`   Admin API   : http://localhost:${PORT}/api/admin  [X-Admin-Key required]`);
     logger.info(`   Categories  : http://localhost:${PORT}/api/categories`);
-    logger.info(`   Admin Key   : ${process.env.ADMIN_SECRET_KEY ? 'Set ✓' : 'NOT SET — admin routes will return 500'}`);
+    logger.info(`   Payments    : http://localhost:${PORT}/api/payments`);
+    logger.info(`   Admin Key   : ${process.env.ADMIN_SECRET_KEY ? 'Set ✓' : 'NOT SET'}`);
+
+    // Verify Stripe secret key at startup
+    if (process.env.STRIPE_SECRET_KEY) {
+      const stripeStatus = await verifyStripeToken();
+      if (stripeStatus.valid) {
+        logger.info(`   Stripe      : Connected ✓  (sandbox: ${process.env.STRIPE_SECRET_KEY.startsWith('sk_test_') ? 'YES' : 'NO'})`);
+      } else {
+        logger.warn(`   Stripe      : Secret key INVALID — ${stripeStatus.error}`);
+      }
+    } else {
+      logger.warn(`   Stripe      : Not configured (set STRIPE_SECRET_KEY to enable online payments)`);
+    }
   });
 }
 

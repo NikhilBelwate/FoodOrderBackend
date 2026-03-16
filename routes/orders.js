@@ -4,6 +4,7 @@ const { supabase, supabaseAdmin } = require('../config/supabase');
 const { createError } = require('../middleware/errorHandler');
 const { requireAuth }  = require('../middleware/authMiddleware');
 const { generateOrderId } = require('../utils/orderIdGenerator');
+const { createPaymentIntent } = require('../services/stripeService');
 
 const router = express.Router();
 
@@ -20,6 +21,8 @@ const CreateOrderSchema = z.object({
   deliveryAddress:     z.string().min(5).max(500),
   specialInstructions: z.string().max(1000).optional().default(''),
   items:               z.array(OrderItemSchema).min(1, 'Order must contain at least one item'),
+  // Optional payment method — defaults to cash on delivery
+  paymentMethod:       z.enum(['pay_on_delivery', 'stripe']).optional().default('pay_on_delivery'),
 });
 
 const OrderStatusSchema = z.object({
@@ -39,7 +42,7 @@ router.post('/', requireAuth, async (req, res, next) => {
       );
     }
 
-    const { customerName, customerEmail, customerPhone, deliveryAddress, specialInstructions, items } = parsed.data;
+    const { customerName, customerEmail, customerPhone, deliveryAddress, specialInstructions, items, paymentMethod } = parsed.data;
 
     // 2. Fetch + validate food items
     const foodItemIds = items.map(i => i.foodItemId);
@@ -105,15 +108,82 @@ router.post('/', requireAuth, async (req, res, next) => {
       throw createError(500, 'DB_ERROR', `Failed to save order items: ${itemsError.message}`);
     }
 
+    // 6. Create payment record + Stripe PaymentIntent ────────────────────────
+    const currency = (process.env.STRIPE_CURRENCY || 'USD').toUpperCase();
+    let stripeDetails = null;
+
+    let paymentRecord = {
+      order_id:       order.id,
+      payment_method: paymentMethod,
+      amount:         totalPrice,
+      currency,
+      payment_status: paymentMethod === 'stripe' ? 'awaiting_payment' : 'pending',
+    };
+
+    if (paymentMethod === 'stripe') {
+      try {
+        // Stripe amounts are in cents (smallest currency unit)
+        const amountCents = Math.round(totalPrice * 100);
+        const pi = await createPaymentIntent(amountCents, currency, {
+          orderDbId:    order.id,
+          orderId:      order.orderId,
+          customerName,
+          customerEmail,
+        });
+
+        paymentRecord.stripe_payment_intent_id = pi.id;
+
+        stripeDetails = {
+          clientSecret:    pi.client_secret,
+          publishableKey:  process.env.STRIPE_PUBLISHABLE_KEY,
+          amount:          totalPrice,
+          currency,
+          paymentIntentId: pi.id,
+        };
+      } catch (stripeErr) {
+        // Stripe call failed — roll back order and surface the error
+        await supabaseAdmin.from('orders').delete().eq('id', order.id);
+        console.error('[orders] Stripe PaymentIntent creation failed:', stripeErr.message);
+        throw createError(502, 'STRIPE_ERROR',
+          `Could not initiate Stripe payment: ${stripeErr.message}`);
+      }
+    }
+
+    const { data: payment, error: paymentInsertErr } = await supabaseAdmin
+      .from('payments')
+      .insert(paymentRecord)
+      .select('id, payment_method, payment_status, stripe_payment_intent_id')
+      .single();
+
+    if (paymentInsertErr) {
+      // Roll back the order so we don't leave orphaned records
+      await supabaseAdmin.from('orders').delete().eq('id', order.id);
+      console.error('[orders] Payment insert failed:', paymentInsertErr.message);
+      throw createError(
+        500, 'PAYMENT_DB_ERROR',
+        `Payment record could not be created: ${paymentInsertErr.message}. ` +
+        `If the payments table is missing, run database/09_stripe_migration.sql or database/08_payments.sql in your Supabase SQL editor.`
+      );
+    }
+
+    // 7. Return response ──────────────────────────────────────────────────────
     res.status(201).json({
       data: {
-        orderId:    order.orderId,
-        id:         order.id,
-        status:     order.status,
-        totalPrice: order.totalPrice,
-        createdAt:  order.createdAt,
+        orderId:       order.orderId,
+        id:            order.id,
+        status:        order.status,
+        totalPrice:    order.totalPrice,
+        createdAt:     order.createdAt,
+        paymentMethod,
+        payment: payment ? {
+          id:     payment.id,
+          status: payment.payment_status,
+        } : null,
+        stripeDetails,   // null for pay_on_delivery
       },
-      message: 'Order placed successfully',
+      message: paymentMethod === 'stripe'
+        ? 'Order placed. Complete payment to confirm.'
+        : 'Order placed successfully',
     });
   } catch (err) {
     next(err);
@@ -132,7 +202,9 @@ router.get('/', requireAuth, async (req, res, next) => {
 
     let query = supabaseAdmin
       .from('orders')
-      .select('*, order_items(id, foodItemId, quantity, price, food_items(id, name, category, imageUrl))', { count: 'exact' })
+      .select(`*, order_items(id, foodItemId, quantity, price, food_items(id, name, category, imageUrl)),
+        payments(id, payment_method, payment_status, stripe_payment_intent_id, amount, currency, created_at)
+      `, { count: 'exact' })
       .eq('user_id', req.user.id)           // ← only this user's orders
       .range(from, to);
 
@@ -173,6 +245,11 @@ router.get('/:orderId', requireAuth, async (req, res, next) => {
         order_items (
           id, foodItemId, quantity, price,
           food_items ( id, name, description, category, imageUrl )
+        ),
+        payments (
+          id, payment_method, payment_status, payment_reference,
+          amount, currency, stripe_payment_intent_id,
+          paid_at, created_at
         )
       `)
       .eq('orderId', req.params.orderId)

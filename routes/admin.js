@@ -142,7 +142,18 @@ router.get('/orders', async (req, res, next) => {
           "foodItemId",
           quantity,
           price,
-          food_items ( name, category )
+          food_items ( name, category, discount_percent, offer_label )
+        ),
+        payments (
+          id,
+          payment_method,
+          payment_status,
+          stripe_payment_intent_id,
+          amount,
+          currency,
+          paid_at,
+          notes,
+          created_at
         )
       `, { count: 'exact' })
       .order('"createdAt"', { ascending: false })
